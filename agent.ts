@@ -5,6 +5,29 @@ import path from "node:path";
 
 loadEnvFile(new URL(".env", import.meta.url));
 
+type ToolCall = {
+    id: string;
+    type: "function";
+    function: {
+        name: string;
+        arguments: string;
+    };
+};
+
+type ChatMessage =
+    | { role: "system" | "user"; content: string }
+    | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
+    | { role: "tool"; tool_call_id: string; content: string };
+
+type ModelMessage = {
+    content: string | null;
+    tool_calls?: ToolCall[];
+};
+
+type CompletionResponse = {
+    choices: Array<{ message: ModelMessage }>;
+};
+
 const READ_FILE = {
     type: "function",
     function: {
@@ -23,14 +46,14 @@ const READ_FILE = {
     },
 };
 
-const messages = [
+const messages: ChatMessage[] = [
     {
         role: "system",
         content: "You are an assistant. Use read_file when you need the contents of a file in this project.",
     },
 ];
 
-async function callModel(messages) {
+async function callModel(messages: ChatMessage[]): Promise<ModelMessage> {
     const baseUrl = process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     const response = await fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
@@ -49,14 +72,14 @@ async function callModel(messages) {
         throw new Error(`${response.status} ${await response.text()}`);
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as CompletionResponse;
     const message = data.choices[0].message;
     console.log("\n--- messages sent ---");
     console.log(JSON.stringify(messages, null, 2));
     return message;
 }
 
-async function readProjectFile(filePath) {
+async function readProjectFile(filePath: string): Promise<string> {
     const root = process.cwd();
     const resolved = path.resolve(root, filePath);
     const insideProject = resolved === root || resolved.startsWith(root + path.sep);
@@ -70,20 +93,32 @@ async function readProjectFile(filePath) {
     try {
         return await readFile(resolved, "utf8");
     } catch (error) {
-        return `Error: ${error.message}`;
+        const message = error instanceof Error ? error.message : String(error);
+        return `Error: ${message}`;
     }
 }
 
-async function runTurn() {
+function filePathFromArgs(raw: string): string {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        !("path" in parsed) ||
+        typeof parsed.path !== "string"
+    ) {
+        throw new Error("read_file requires a path string");
+    }
+    return parsed.path;
+}
+
+async function runTurn(): Promise<void> {
     for (let step = 0; step < 8; step++) {
         const message = await callModel(messages);
-        const assistantMessage = {
+        const assistantMessage: ChatMessage = {
             role: "assistant",
             content: message.content ?? "",
+            ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
         };
-        if (message.tool_calls) {
-            assistantMessage.tool_calls = message.tool_calls;
-        }
         messages.push(assistantMessage);
 
         const toolCalls = message.tool_calls ?? [];
@@ -93,10 +128,9 @@ async function runTurn() {
         }
 
         for (const toolCall of toolCalls) {
-            const args = JSON.parse(toolCall.function.arguments);
             console.log(`\ntool> ${toolCall.function.name} ${toolCall.function.arguments}`);
             const result = toolCall.function.name === "read_file"
-                ? await readProjectFile(args.path)
+                ? await readProjectFile(filePathFromArgs(toolCall.function.arguments))
                 : `Error: unknown tool ${toolCall.function.name}`;
             messages.push({
                 role: "tool",
